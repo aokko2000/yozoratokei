@@ -1661,12 +1661,12 @@ void setup() {
   bootStage(imuOk ? "4 センサー OK" : "4 センサー NG", !imuOk);
   bool haveOffsets = imuOk && M5.Imu.loadOffsetFromNVS();
 
-  // カメラは起動確認だけして一旦止める (使うのはカメラモードの間だけ)
-  cameraOk = CoreS3.Camera.begin();
-  if (cameraOk) { esp_camera_deinit(); }
+  // 起動時にカメラを初期化してはいけない。esp_camera_deinit() が共用の内部I2Cドライバ
+  // ごと破棄してしまい、コンパス(BMM150)が起動直後から読めなくなるため。
+  // カメラはカメラモードに入るときに初めて起動する。
+  cameraOk   = true;
   camRunning = false;
-  Serial.printf("camera: %s\n", cameraOk ? "OK" : "FAIL");
-  bootStage(cameraOk ? "5 カメラ OK" : "5 カメラ NG(無効)", !cameraOk);
+  bootStage("5 カメラ (使う時に起動)");
 
   // LTR-553 環境光センサー (自動調光に使用)
   Ltr5xx_Init_Basic_Para ltrPara = {};
