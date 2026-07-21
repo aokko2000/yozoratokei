@@ -15,6 +15,12 @@
 #include <M5Unified.h>
 #include <M5CoreS3.h> // カメラ(GC0308)用。M5.〜 と同じ実体を参照する薄いラッパー
 #include <Preferences.h>
+#include <SPI.h>
+#include <SD.h>
+#include "img_converters.h" // fmt2jpg (RGB565→JPEG)
+
+// CoreS3 microSD (SPI)
+static constexpr int SD_SCK = 36, SD_MISO = 35, SD_MOSI = 37, SD_CS = 4;
 #include <math.h>
 #include <time.h>
 #include "star_catalog.h"
@@ -129,6 +135,8 @@ static long    skyOffsetSec = 0;
 
 static bool    cameraOk   = false; // GC0308カメラが初期化できたか
 static bool    ltrOk      = false; // LTR-553 環境光センサーが初期化できたか
+static bool    sdOk       = false; // microSDカードが使えるか
+static String  lastSavePath;       // 直近の保存先 (カード表示用)
 
 // ---------------- Scroll Unit (回して星座送り+時間早送り) ----------------
 static bool    scrollOk   = false;
@@ -1447,6 +1455,34 @@ static void captureCard() {
   snprintf(buf, sizeof(buf), "月齢%.1f %s", age, moonName(age));
   canvas.drawString(buf, 312, 219);
 
+  // ここまでのカードをJPEGでSDへ保存 (状態テキストは保存後に描く)
+  lastSavePath = "";
+  if (sdOk) {
+    uint8_t* jpg = nullptr; size_t jlen = 0;
+    if (fmt2jpg((uint8_t*)canvas.getBuffer(), 320 * 240 * 2, 320, 240,
+                PIXFORMAT_RGB565, 90, &jpg, &jlen)) {
+      int n = prefs.getInt("imgn", 0) + 1;
+      char path[24];
+      snprintf(path, sizeof(path), "/yozora_%04d.jpg", n);
+      File f = SD.open(path, FILE_WRITE);
+      if (f) {
+        f.write(jpg, jlen); f.close();
+        prefs.putInt("imgn", n);
+        lastSavePath = String(path);
+      } else {
+        lastSavePath = "SD書込失敗";
+      }
+      free(jpg);
+    } else {
+      lastSavePath = "JPEG変換失敗";
+    }
+  }
+  // 保存状態 (左上・タイトル下)
+  canvas.setFont(&fonts::lgfxJapanGothic_12);
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(sdOk ? COL_TEXT : COL_DIM);
+  canvas.drawString(sdOk ? ("保存 " + lastSavePath) : "SDなし (表示のみ)", 8, 28);
+
   canvas.pushSprite(0, 0);
   cardUntilMs = millis() + 4000;
   soundChime();
@@ -1565,6 +1601,11 @@ void setup() {
   ltrOk = CoreS3.Ltr553.begin(&ltrPara);
   if (ltrOk) CoreS3.Ltr553.setAlsMode(LTR5XX_ALS_ACTIVE_MODE);
   Serial.printf("ltr553: %s\n", ltrOk ? "OK" : "FAIL");
+
+  // microSD (写真カードのJPEG保存に使用。無ければ表示のみ)
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  sdOk = SD.begin(SD_CS, SPI, 20000000);
+  Serial.printf("sd: %s\n", sdOk ? "OK" : "none");
   bootStage("6 起動完了");
   delay(600); // 進捗を見せる
 
