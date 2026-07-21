@@ -13,6 +13,7 @@
 // =============================================================
 
 #include <M5Unified.h>
+#include <M5CoreS3.h> // カメラ(GC0308)用。M5.〜 と同じ実体を参照する薄いラッパー
 #include <Preferences.h>
 #include <math.h>
 #include <time.h>
@@ -104,7 +105,7 @@ struct Vec3 { float x, y, z; };
 static M5Canvas canvas(&M5.Display);
 static bool     spriteOk = false;
 
-enum class Mode { Calibrating, Main, MoonClock, SetTime };
+enum class Mode { Calibrating, Main, MoonClock, SetTime, Camera };
 static Mode     mode            = Mode::Main;
 static Mode     modeBeforeCalib = Mode::Main;
 static uint32_t calibEndMs      = 0;
@@ -120,6 +121,8 @@ static const char* SETF_NAME[5] = { "年", "月", "日", "時", "分" };
 
 // 時間早送り: 星空・月・イベント表示を進める/戻すオフセット (秒)。0=現在時刻。
 static long    skyOffsetSec = 0;
+
+static bool    cameraOk   = false; // GC0308カメラが初期化できたか
 
 // ---------------- Scroll Unit (回して星座送り+時間早送り) ----------------
 static bool    scrollOk   = false;
@@ -1379,9 +1382,25 @@ static void handleTouch() {
     if (mode == Mode::MoonClock) toggleSound(); // 月時計: 長押しで音ON/OFF
     else startCalibration();                    // 星空: 長押しで再キャリブレーション
   } else if (t.wasClicked()) {
-    mode = (mode == Mode::Main) ? Mode::MoonClock : Mode::Main;
+    // タップで切替: 星空 → 月時計 → (カメラ) → 星空
+    if (mode == Mode::Main)           mode = Mode::MoonClock;
+    else if (mode == Mode::MoonClock) mode = cameraOk ? Mode::Camera : Mode::Main;
+    else                              mode = Mode::Main;
     soundModeSwitch();
   }
+}
+
+// ---------------- カメラ (M5CoreS3のGC0308。内部I2C共有はライブラリが処理) ----------------
+static void drawCamera() {
+  if (CoreS3.Camera.get()) {
+    M5.Display.pushImage(0, 0, CoreS3.Camera.fb->width, CoreS3.Camera.fb->height,
+                         (uint16_t*)CoreS3.Camera.fb->buf);
+    CoreS3.Camera.free();
+  }
+  M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+  M5.Display.setTextDatum(bottom_left);
+  M5.Display.setTextColor(COL_ACCENT, COL_BG);
+  M5.Display.drawString("カメラ  タップで戻る", 6, 236);
 }
 
 // ---------------- メイン ----------------
@@ -1400,7 +1419,7 @@ void setup() {
   auto cfg = M5.config();
   cfg.internal_imu = true;
   cfg.internal_spk = true;
-  M5.begin(cfg);
+  CoreS3.begin(cfg); // M5.begin相当 + カメラ電源等のCoreS3固有初期化
   Serial.println("yozoratokei: boot");
 
   prefs.begin("yozora", false);
@@ -1456,7 +1475,11 @@ void setup() {
   Serial.printf("imu=%d rtc=%d\n", (int)M5.Imu.getType(), (int)rtcOk);
   bootStage(imuOk ? "4 センサー OK" : "4 センサー NG", !imuOk);
   bool haveOffsets = imuOk && M5.Imu.loadOffsetFromNVS();
-  bootStage("5 起動完了");
+
+  cameraOk = CoreS3.Camera.begin(); // 失敗してもカメラ機能を無効化するだけ
+  Serial.printf("camera: %s\n", cameraOk ? "OK" : "FAIL");
+  bootStage(cameraOk ? "5 カメラ OK" : "5 カメラ NG(無効)", !cameraOk);
+  bootStage("6 起動完了");
   delay(600); // 進捗を見せる
 
   if (!imuOk) {
@@ -1497,6 +1520,7 @@ void loop() {
     case Mode::Calibrating: tickCalibration(); drawCalibration(); break;
     case Mode::MoonClock:   drawMoonClock();                      break;
     case Mode::SetTime:     drawSetTime();                        break;
+    case Mode::Camera:      drawCamera();                         break;
     default:
       if (!imuOk) { mode = Mode::MoonClock; break; }
       drawMain();
