@@ -4,12 +4,15 @@
 //  月時計モード: DinBase据え置き用。月齢・満ち欠け・月食・流星群 (iroirotokei移植)
 //
 //  操作: タップ = プラネタリウム ⇄ 月時計 / 長押し(1秒) = コンパス再補正
-//  時刻: RTC↔内部クロック + Wi-Fi NTP。シリアル(115200)から
-//        "N"=NTP同期 "D 2026-07-20 21:30:00" "T 21:30:00" "V"=デバッグ表示
+//  Scroll Unit (Port A, 任意): 回す=対象を操作 / クリック=対象切替(時間→星座→画面→音量)
+//        / 長押し=対象リセット。時間=星空早送り, 星座=送って矢印で誘導, 画面=表示切替, 音量=調節
+//  画面プリセット: 標準 / 屋外(高コントラスト・最大輝度) / 夜間(赤・暗順応を保つ)
+//  時刻: RTC + 手動時刻合わせ (月時計でScroll長押し → 時刻合わせ画面)。RTCに保存。
+//        シリアル(115200): "D 2026-07-20 21:30:00" "T 21:30:00" で設定も可
+//        "V"=デバッグ "B"=画面切替 "S"=音 "+/-"=音量
 // =============================================================
 
 #include <M5Unified.h>
-#include <WiFi.h>
 #include <Preferences.h>
 #include <math.h>
 #include <time.h>
@@ -32,16 +35,68 @@ static constexpr float SCREEN_SX = 1, SCREEN_SY = 1;
 static constexpr float FOCAL_PX = 300.0f;
 
 // ---------------- 色 (夜空トーン) ----------------
-static constexpr uint16_t COL_BG      = 0x0021; // ほぼ黒の濃紺
-static constexpr uint16_t COL_TEXT    = 0xCE9F; // 淡い星色
-static constexpr uint16_t COL_ACCENT  = 0xFEA0; // 月色 (amber)
-static constexpr uint16_t COL_WARN    = 0xF9E7; // 赤系
-static constexpr uint16_t COL_DIM     = 0x630C; // 補助テキスト
-static constexpr uint16_t COL_LINE    = 0x2150; // 星座線 (暗い藍)
-static constexpr uint16_t COL_CNAME   = 0x8C71; // 星座名 (くすんだ金)
-static constexpr uint16_t COL_SNAME   = 0x4D93; // 恒星名 (暗い水色)
-static constexpr uint16_t COL_HORIZON = 0x29A6; // 地平線
-static constexpr uint16_t COL_RING    = 0x39C7;
+// 基準パレット。表示プリセット(標準/屋外/夜間)で COL_* を書き換えて使う。
+static constexpr uint16_t BASE_BG      = 0x0021; // ほぼ黒の濃紺
+static constexpr uint16_t BASE_TEXT    = 0xCE9F; // 淡い星色
+static constexpr uint16_t BASE_ACCENT  = 0xFEA0; // 月色 (amber)
+static constexpr uint16_t BASE_WARN    = 0xF9E7; // 赤系
+static constexpr uint16_t BASE_DIM     = 0x630C; // 補助テキスト
+static constexpr uint16_t BASE_LINE    = 0x2150; // 星座線 (暗い藍)
+static constexpr uint16_t BASE_CNAME   = 0x8C71; // 星座名 (くすんだ金)
+static constexpr uint16_t BASE_SNAME   = 0x4D93; // 恒星名 (暗い水色)
+static constexpr uint16_t BASE_HORIZON = 0x29A6; // 地平線
+static constexpr uint16_t BASE_RING    = 0x39C7;
+
+// 実際に描画で参照する色 (applyDisplayPreset で設定)
+static uint16_t COL_BG, COL_TEXT, COL_ACCENT, COL_WARN, COL_DIM,
+                COL_LINE, COL_CNAME, COL_SNAME, COL_HORIZON, COL_RING;
+
+// 表示プリセット: 0=標準 1=屋外(高コントラスト) 2=夜間(赤)
+enum DisplayPreset : uint8_t { DP_NORMAL = 0, DP_OUTDOOR, DP_NIGHT, DP_COUNT };
+static uint8_t displayPreset = DP_NORMAL;
+static const char* DP_NAME[DP_COUNT] = { "標準", "屋外", "夜間" };
+
+static void unpack565(uint16_t c, int& r, int& g, int& b) {
+  r = (c >> 11) & 0x1F; g = (c >> 5) & 0x3F; b = c & 0x1F;
+}
+static uint16_t pack565(int r, int g, int b) {
+  r = constrain(r, 0, 31); g = constrain(g, 0, 63); b = constrain(b, 0, 31);
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+// 屋外: 明るさとコントラストを持ち上げる
+static uint16_t brighten(uint16_t c) {
+  int r, g, b; unpack565(c, r, g, b);
+  return pack565((int)(r * 1.4f + 3), (int)(g * 1.4f + 6), (int)(b * 1.4f + 3));
+}
+// 夜間: 輝度を赤に変換 (暗順応を壊さない赤黒表示)
+static uint16_t toRed(uint16_t c) {
+  int r, g, b; unpack565(c, r, g, b);
+  float luma = (r / 31.0f * 0.3f + g / 63.0f * 0.5f + b / 31.0f * 0.2f); // 0..1
+  int rr = (int)(luma * 31 + 0.5f);
+  return pack565(rr, rr / 6, 0);
+}
+
+static void applyDisplayPreset(uint8_t p) {
+  displayPreset = p % DP_COUNT;
+  uint16_t (*f)(uint16_t) = nullptr;
+  uint8_t bright = 200;
+  switch (displayPreset) {
+    case DP_OUTDOOR: f = brighten; bright = 255; break;
+    case DP_NIGHT:   f = toRed;    bright = 70;  break;
+    default:         f = nullptr;  bright = 200; break;
+  }
+  COL_BG      = (displayPreset == DP_NIGHT) ? 0x0000 : BASE_BG;
+  COL_TEXT    = f ? f(BASE_TEXT)    : BASE_TEXT;
+  COL_ACCENT  = f ? f(BASE_ACCENT)  : BASE_ACCENT;
+  COL_WARN    = f ? f(BASE_WARN)    : BASE_WARN;
+  COL_DIM     = f ? f(BASE_DIM)     : BASE_DIM;
+  COL_LINE    = f ? f(BASE_LINE)    : BASE_LINE;
+  COL_CNAME   = f ? f(BASE_CNAME)   : BASE_CNAME;
+  COL_SNAME   = f ? f(BASE_SNAME)   : BASE_SNAME;
+  COL_HORIZON = f ? f(BASE_HORIZON) : BASE_HORIZON;
+  COL_RING    = f ? f(BASE_RING)    : BASE_RING;
+  M5.Display.setBrightness(bright);
+}
 
 // ---------------- 状態 ----------------
 struct Vec3 { float x, y, z; };
@@ -49,7 +104,7 @@ struct Vec3 { float x, y, z; };
 static M5Canvas canvas(&M5.Display);
 static bool     spriteOk = false;
 
-enum class Mode { Calibrating, Main, MoonClock };
+enum class Mode { Calibrating, Main, MoonClock, SetTime };
 static Mode     mode            = Mode::Main;
 static Mode     modeBeforeCalib = Mode::Main;
 static uint32_t calibEndMs      = 0;
@@ -57,6 +112,24 @@ static uint32_t lastCalibKickMs = 0;
 static bool     debugView       = false;
 static bool     imuOk           = false;
 static bool     rtcOk           = false;
+
+// 時刻合わせ画面 (Scrollで手動設定。PC/Wi-Fi不要)
+static struct tm setTm = {};
+static int         setField = 0; // 0=年 1=月 2=日 3=時 4=分
+static const char* SETF_NAME[5] = { "年", "月", "日", "時", "分" };
+
+// 時間早送り: 星空・月・イベント表示を進める/戻すオフセット (秒)。0=現在時刻。
+static long    skyOffsetSec = 0;
+
+// ---------------- Scroll Unit (回して星座送り+時間早送り) ----------------
+static bool    scrollOk   = false;
+static int16_t scrollLast = 0;        // 前回のエンコーダ生値 (差分計算用)
+static int16_t selConst   = -1;       // 選択中の星座 (-1=なし)
+// ノブが操作する対象。クリックで切替。
+enum class Knob : uint8_t { Time, Constellation, Display, Volume };
+static constexpr uint8_t KNOB_COUNT = 4;
+static Knob    knob        = Knob::Time;
+static const char* KNOB_NAME[KNOB_COUNT] = { "時間", "星座", "画面", "音量" };
 
 static Vec3 lpAccel, lpMag;
 static bool haveFilter = false;
@@ -75,13 +148,17 @@ static const char* DIR16[16] = {
   "南", "南南西", "南西", "西南西", "西", "西北西", "北西", "北北西"
 };
 
-static void startCalibration(); // 前方宣言 (シリアルコマンドから呼ぶ)
+static void startCalibration();               // 前方宣言 (シリアルコマンドから呼ぶ)
+static void systemTimeFromTm(struct tm& t);   // 前方宣言 (時刻合わせから呼ぶ)
+static void writeRtc(struct tm& t);
+static void getNow(struct tm& out);
 
 // ---------------- サウンド (iroirotokei譲りのペンタトニック星空音) ----------------
 // ノンブロッキングの簡易シーケンサ: loop() から updateSound() を回す
 static Preferences prefs;
-static bool soundOn = true;
-static bool spkOk   = false;
+static bool    soundOn = true;
+static bool    spkOk   = false;
+static uint8_t sndVol  = 110; // 音量 0〜255 (NVSから復元)
 
 struct ToneStep { uint16_t freq; uint16_t durMs; uint16_t gapMs; };
 static ToneStep sndSeq[6];
@@ -145,6 +222,14 @@ static void toggleSound() {
   prefs.putBool("sound", soundOn);
 }
 
+// 音量変更 (確認ビープは soundOn に関係なく鳴らして音量が分かるように)
+static void changeVolume(int delta) {
+  int v = (int)sndVol + delta;
+  sndVol = (uint8_t)constrain(v, 0, 255);
+  prefs.putUChar("vol", sndVol);
+  if (spkOk) { M5.Speaker.setVolume(sndVol); M5.Speaker.tone(1319, 60); }
+}
+
 // 星座発見アナウンス: 中央の星座が0.5秒安定したら一度だけ鳴らす
 static int      lastCenterC   = -2;
 static int      announcedC    = -1;
@@ -157,6 +242,161 @@ static void announceConstellation(int c) {
     soundConstellation(c);
   }
   if (c < 0 && now - centerSinceMs > 3000) announcedC = -1; // 外れてしばらくしたら再び鳴らせる
+}
+
+// ---------------- Scroll Unit ドライバ (M5.Ex_I2C 直叩き) ----------------
+// I2C 0x40 / ENCODER 0x10(int16 累積) / BUTTON 0x20 / RGB 0x30 / RESET 0x40
+static constexpr uint8_t SCROLL_ADDR = 0x40;
+static constexpr uint8_t SCROLL_ENC  = 0x10;
+static constexpr uint8_t SCROLL_BTN  = 0x20;
+static constexpr uint8_t SCROLL_RGB  = 0x30;
+static constexpr uint8_t SCROLL_RST  = 0x40;
+
+static void scrollSetLed(uint8_t r, uint8_t g, uint8_t b) {
+  if (!scrollOk) return;
+  uint8_t rgb[3] = { r, g, b };
+  M5.Ex_I2C.writeRegister(SCROLL_ADDR, SCROLL_RGB, rgb, 3, 100000);
+}
+
+static void scrollBegin() {
+  M5.Ex_I2C.begin();
+  uint8_t v = 0;
+  scrollOk = M5.Ex_I2C.readRegister(SCROLL_ADDR, SCROLL_BTN, &v, 1, 100000);
+  if (scrollOk) {
+    uint8_t buf[2];
+    if (M5.Ex_I2C.readRegister(SCROLL_ADDR, SCROLL_ENC, buf, 2, 100000))
+      scrollLast = (int16_t)(buf[0] | (buf[1] << 8));
+  }
+  Serial.printf("scroll=%s\n", scrollOk ? "ok" : "none");
+}
+
+// ノブの色: 時間=琥珀 星座=水色 画面=白 音量=緑
+static void scrollUpdateLed() {
+  switch (knob) {
+    case Knob::Time:          scrollSetLed(40, 20, 0); break;
+    case Knob::Constellation: scrollSetLed(0, 24, 32); break;
+    case Knob::Display:       scrollSetLed(24, 24, 24); break;
+    case Knob::Volume:        scrollSetLed(0, 36, 8);  break;
+  }
+}
+
+// 時刻合わせ画面へ入る (現在時刻を初期値にする)
+static void enterSetTime() {
+  getNow(setTm);
+  if (setTm.tm_year + 1900 < 2024) { setTm.tm_year = 2026 - 1900; } // 妙な値なら既定年
+  setField = 0;
+  mode = Mode::SetTime;
+}
+
+// 時刻合わせ: いま選んでいるフィールドを増減
+static void adjustSetField(int dir) {
+  switch (setField) {
+    case 0: setTm.tm_year = constrain(setTm.tm_year + dir, 2024 - 1900, 2099 - 1900); break;
+    case 1: setTm.tm_mon  = (setTm.tm_mon + dir + 12) % 12; break;
+    case 2: setTm.tm_mday += dir; if (setTm.tm_mday < 1) setTm.tm_mday = 31; if (setTm.tm_mday > 31) setTm.tm_mday = 1; break;
+    case 3: setTm.tm_hour = (setTm.tm_hour + dir + 24) % 24; break;
+    case 4: setTm.tm_min  = (setTm.tm_min + dir + 60) % 60; break;
+  }
+}
+
+// 時刻合わせ画面での Scroll 操作 (回す=変更 / 短押し=次へ・確定 / 長押し=中止)
+static void setTimeScrollTick() {
+  uint8_t buf[2];
+  if (M5.Ex_I2C.readRegister(SCROLL_ADDR, SCROLL_ENC, buf, 2, 100000)) {
+    int16_t cur = (int16_t)(buf[0] | (buf[1] << 8));
+    int16_t delta = (int16_t)(cur - scrollLast);
+    scrollLast = cur;
+    if (delta != 0) adjustSetField(delta > 0 ? 1 : -1);
+  }
+  static bool wasDown = false; static uint32_t downMs = 0; static bool longFired = false;
+  uint8_t b = 1;
+  M5.Ex_I2C.readRegister(SCROLL_ADDR, SCROLL_BTN, &b, 1, 100000);
+  bool down = (b == 0);
+  uint32_t now = millis();
+  if (down && !wasDown) { wasDown = true; downMs = now; longFired = false; }
+  if (down && wasDown && !longFired && now - downMs > 700) {
+    longFired = true; // 長押し: 中止
+    mode = Mode::MoonClock;
+    soundToggleOff();
+  }
+  if (!down && wasDown) {
+    wasDown = false;
+    if (!longFired) {
+      if (setField < 4) { setField++; soundModeSwitch(); } // 次のフィールドへ
+      else { // 確定: 内部クロックとRTCに書き込む
+        setTm.tm_sec = 0;
+        systemTimeFromTm(setTm);
+        writeRtc(setTm);
+        skyOffsetSec = 0;
+        mode = Mode::MoonClock;
+        soundChime();
+      }
+    }
+  }
+}
+
+static void updateScroll() {
+  if (!scrollOk) return;
+  if (mode == Mode::SetTime) { setTimeScrollTick(); return; }
+  // --- エンコーダ差分 ---
+  uint8_t buf[2];
+  if (M5.Ex_I2C.readRegister(SCROLL_ADDR, SCROLL_ENC, buf, 2, 100000)) {
+    int16_t cur = (int16_t)(buf[0] | (buf[1] << 8));
+    int16_t delta = (int16_t)(cur - scrollLast); // int16の巻き戻りも吸収
+    scrollLast = cur;
+    if (delta != 0) {
+      switch (knob) {
+        case Knob::Time:
+          skyOffsetSec += (long)delta * 300; // 1目盛5分
+          break;
+        case Knob::Constellation: {
+          int base = (selConst < 0) ? 0 : selConst;
+          base = (base + (delta > 0 ? 1 : -1) + CONSTELLATION_COUNT) % CONSTELLATION_COUNT;
+          selConst = base;
+          break;
+        }
+        case Knob::Display:
+          applyDisplayPreset((displayPreset + (delta > 0 ? 1 : DP_COUNT - 1)) % DP_COUNT);
+          prefs.putUChar("disp", displayPreset);
+          break;
+        case Knob::Volume:
+          changeVolume((int)delta * 10);
+          break;
+      }
+    }
+  }
+  // --- ボタン (エッジ検出 + 長押し) ---
+  static bool     wasDown   = false;
+  static uint32_t downMs    = 0;
+  static bool     longFired = false;
+  uint8_t b = 1;
+  M5.Ex_I2C.readRegister(SCROLL_ADDR, SCROLL_BTN, &b, 1, 100000);
+  bool down = (b == 0); // アクティブLow
+  uint32_t now = millis();
+  if (down && !wasDown) { wasDown = true; downMs = now; longFired = false; }
+  if (down && wasDown && !longFired && now - downMs > 700) {
+    longFired = true;
+    if (mode == Mode::MoonClock) { // 月時計で長押し = 時刻合わせ画面へ
+      enterSetTime();
+    } else { // 星空: 現在の対象をリセット
+      switch (knob) {
+        case Knob::Time:          skyOffsetSec = 0; break;
+        case Knob::Constellation: selConst = -1;    break;
+        case Knob::Display:       applyDisplayPreset(DP_NORMAL); prefs.putUChar("disp", DP_NORMAL); break;
+        case Knob::Volume:        sndVol = 110; prefs.putUChar("vol", sndVol);
+                                  if (spkOk) M5.Speaker.setVolume(sndVol); break;
+      }
+      soundToggleOff();
+    }
+  }
+  if (!down && wasDown) {
+    wasDown = false;
+    if (!longFired) { // 短押し: ノブの対象を切替
+      knob = (Knob)(((uint8_t)knob + 1) % KNOB_COUNT);
+      scrollUpdateLed();
+      soundModeSwitch();
+    }
+  }
 }
 
 // ---------------- ベクトル演算 ----------------
@@ -194,8 +434,11 @@ static void writeRtc(struct tm& t) {
   M5.Rtc.setDateTime(dt);
 }
 
+// 時間早送りは星空モードのみ有効。月時計モードは常に本当の現在時刻を表示する。
+static time_t skyTime() { return time(nullptr) + (mode == Mode::Main ? skyOffsetSec : 0); }
+
 static void getNow(struct tm& out) {
-  time_t now = time(nullptr);
+  time_t now = skyTime();
   localtime_r(&now, &out);
 }
 
@@ -243,49 +486,9 @@ static void setupClock() {
   }
 }
 
-// --- Wi-Fi + NTP 自動時刻同期 (保存済みWi-Fi設定で接続、失敗したら諦める) ---
-enum SyncState : uint8_t { SY_IDLE, SY_CONNECTING, SY_WAITTIME };
-static SyncState syncState   = SY_IDLE;
-static uint32_t  syncStartMs = 0;
-static bool      ntpSynced   = false;
-
-static void startNtpSync() {
-  if (syncState != SY_IDLE) return;
-  WiFi.mode(WIFI_STA);
-  WiFi.begin();
-  syncState   = SY_CONNECTING;
-  syncStartMs = millis();
-}
-
-static void stopWifi() {
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  syncState = SY_IDLE;
-}
-
-static void updateNtpSync() {
-  if (syncState == SY_IDLE) return;
-  if (syncState == SY_CONNECTING) {
-    if (WiFi.status() == WL_CONNECTED) {
-      configTzTime("JST-9", "ntp.jst.mfeed.ad.jp", "pool.ntp.org", "time.google.com");
-      syncState   = SY_WAITTIME;
-      syncStartMs = millis();
-    } else if (millis() - syncStartMs > 15000) {
-      stopWifi();
-    }
-    return;
-  }
-  struct tm t;
-  getNow(t);
-  if (t.tm_year + 1900 >= 2024) {
-    writeRtc(t);
-    stopWifi();
-    ntpSynced = true;
-    Serial.println("OK: NTP time synced");
-  } else if (millis() - syncStartMs > 15000) {
-    stopWifi();
-  }
-}
+// 時刻はRTC + 手動時刻合わせ(Scroll長押し)で保持する。
+// (Wi-Fi/NTPは WiFiManager のポータルがこのボードで不安定=再起動を繰り返すため撤去した)
+static constexpr bool ntpSynced = false;
 
 // シリアルからの操作  "N"=NTP同期  "D 2026-07-20 21:30:00"  "T 21:30:00"  "V"=デバッグ
 static void handleSerialTimeSet() {
@@ -308,11 +511,6 @@ static void handleSerialTimeSet() {
   work.trim();
   if (work.length() < 1) return;
 
-  if (work[0] == 'N' || work[0] == 'n') {
-    Serial.println("OK: starting NTP sync...");
-    startNtpSync();
-    return;
-  }
   if (work[0] == 'V' || work[0] == 'v') {
     debugView = !debugView;
     Serial.printf("OK: debug %s\n", debugView ? "on" : "off");
@@ -333,6 +531,14 @@ static void handleSerialTimeSet() {
     Serial.printf("OK: sound %s\n", soundOn ? "on" : "off");
     return;
   }
+  if (work[0] == 'B' || work[0] == 'b') { // 表示プリセット切替 (標準→屋外→夜間)
+    applyDisplayPreset((displayPreset + 1) % DP_COUNT);
+    prefs.putUChar("disp", displayPreset);
+    Serial.printf("OK: display %s\n", DP_NAME[displayPreset]);
+    return;
+  }
+  if (work[0] == '+') { changeVolume(+15); Serial.printf("OK: vol %d\n", sndVol); return; }
+  if (work[0] == '-') { changeVolume(-15); Serial.printf("OK: vol %d\n", sndVol); return; }
   struct tm t;
   getNow(t);
   int y, mo, d, hh, mm, ss;
@@ -358,15 +564,40 @@ static void handleSerialTimeSet() {
 
 // ---------------- 月の計算 (iroirotokei移植 + 位置計算) ----------------
 // 月の位相角 0°=新月 180°=満月 (Meeus簡易式、誤差は数時間程度)
+// Meeus「天文計算」49章: 第k朔(新月)の時刻 (ユリウス日, 誤差 数分)
+static double newMoonJDE(double k) {
+  double T  = k / 1236.85;
+  double jde = 2451550.09766 + 29.530588861 * k + 0.00015437 * T * T
+             - 0.000000150 * T * T * T;
+  double E  = 1 - 0.002516 * T - 0.0000074 * T * T;
+  double M  = (2.5534 + 29.10535670 * k - 0.0000014 * T * T) * DEG_TO_RAD;      // 太陽の平均近点角
+  double Mp = (201.5643 + 385.81693528 * k + 0.0107582 * T * T) * DEG_TO_RAD;   // 月の平均近点角
+  double F  = (160.7108 + 390.67050284 * k - 0.0016118 * T * T) * DEG_TO_RAD;   // 緯度引数
+  double Om = (124.7746 - 1.56375588 * k + 0.0020672 * T * T) * DEG_TO_RAD;
+  double c  = -0.40720 * sin(Mp) + 0.17241 * E * sin(M) + 0.01608 * sin(2 * Mp)
+            + 0.01039 * sin(2 * F) + 0.00739 * E * sin(Mp - M) - 0.00514 * E * sin(Mp + M)
+            + 0.00208 * E * E * sin(2 * M) - 0.00111 * sin(Mp - 2 * F)
+            - 0.00057 * sin(Mp + 2 * F) + 0.00056 * E * sin(2 * Mp + M)
+            - 0.00042 * sin(3 * Mp) + 0.00042 * E * sin(M + 2 * F)
+            + 0.00038 * E * sin(M - 2 * F) + 0.00325 * sin(Om);
+  return jde + c;
+}
+
+// 月齢 (直前の新月からの経過日数)。0=新月, 約14.77=満月, 約29.53で次の新月。
+static double moonAgeDays() {
+  double jd = skyTime() / 86400.0 + 2440587.5; // UTC→ユリウス日
+  double k  = floor((jd - 2451550.09766) / 29.530588861);
+  double nm = newMoonJDE(k);
+  if (nm > jd) { k -= 1; nm = newMoonJDE(k); } // 直前の新月にそろえる
+  double age = jd - nm;
+  if (age < 0) age += 29.530588861;
+  return age;
+}
+
+// 位相角[deg] 0=新月 180=満月 (月齢から換算。描画と月齢表示を一致させる)
 static float moonPhaseDeg() {
-  double jd = time(nullptr) / 86400.0 + 2440587.5; // UTC→ユリウス日
-  double T  = (jd - 2451545.0) / 36525.0;
-  double Mp = fmod(134.963 + 477198.8676 * T, 360.0) * 0.0174533;
-  double M  = fmod(357.529 + 35999.0503  * T, 360.0) * 0.0174533;
-  double lm = fmod(218.316 + 481267.8813 * T, 360.0) + 6.289 * sin(Mp);
-  double ls = fmod(280.459 + 36000.7698  * T, 360.0) + 1.915 * sin(M);
-  double d  = fmod(lm - ls, 360.0);
-  if (d < 0) d += 360.0;
+  double d = moonAgeDays() / 29.530588861 * 360.0;
+  if (d >= 360.0) d -= 360.0;
   return (float)d;
 }
 
@@ -384,7 +615,7 @@ static const char* moonName(float age) {
 
 // 月の赤経・赤緯 (簡易式: 黄経黄緯→赤道座標。誤差1°程度、表示用途には十分)
 static void moonEquatorial(float& raDeg, float& decDeg) {
-  double jd = time(nullptr) / 86400.0 + 2440587.5;
+  double jd = skyTime() / 86400.0 + 2440587.5;
   double T  = (jd - 2451545.0) / 36525.0;
   double Mp = fmod(134.963 + 477198.8676 * T, 360.0) * 0.0174533; // 平均近点角
   double F  = fmod(93.272  + 483202.0175 * T, 360.0) * 0.0174533; // 緯度引数
@@ -424,7 +655,7 @@ static time_t eclipseEpoch(const EclipseEv& e) {
 
 // 次の月食 (終了済みはスキップ)。diffSec = 食の最大までの秒 (負=最大は過ぎた)
 static const EclipseEv* nextEclipse(long* diffSec) {
-  time_t now = time(nullptr);
+  time_t now = skyTime();
   for (const auto& e : ECLIPSES) {
     long d = (long)(eclipseEpoch(e) - now);
     if (d > -4 * 3600) {
@@ -564,7 +795,7 @@ static bool computeAttitude() {
 
 // ---------------- 天球 → 画面投影 ----------------
 static float localSiderealDeg() {
-  double d = (double)(time(nullptr) - 946728000LL) / 86400.0; // J2000からの日数
+  double d = (double)(skyTime() - 946728000LL) / 86400.0; // J2000からの日数
   double lst = fmod(280.46061837 + 360.98564736629 * d + OBS_LON_DEG, 360.0);
   if (lst < 0) lst += 360.0;
   return (float)lst;
@@ -610,6 +841,30 @@ static void projectStars() {
   }
 }
 
+// 星座の平均位置 → 方位[deg] と 高度[deg] (星座送りの誘導矢印用)
+static void constellationAzEl(int c, float& azOut, float& elOut) {
+  const Constellation& cc = CONSTELLATIONS[c];
+  float sx = 0, sy = 0, sz = 0;
+  for (int l = 0; l < cc.nLines; ++l) {
+    for (int e = 0; e < 2; ++e) {
+      uint8_t s = cc.lines[l][e];
+      float ra = STARS[s].ra * DEG_TO_RAD, dec = STARS[s].dec * DEG_TO_RAD;
+      sx += cosf(dec) * cosf(ra); sy += cosf(dec) * sinf(ra); sz += sinf(dec);
+    }
+  }
+  float ra  = atan2f(sy, sx) * RAD_TO_DEG; if (ra < 0) ra += 360;
+  float dec = atan2f(sz, sqrtf(sx * sx + sy * sy)) * RAD_TO_DEG;
+  float lst = localSiderealDeg();
+  float sinLat = sinf(OBS_LAT_DEG * DEG_TO_RAD), cosLat = cosf(OBS_LAT_DEG * DEG_TO_RAD);
+  float H = (lst - ra) * DEG_TO_RAD;
+  float sinDec = sinf(dec * DEG_TO_RAD), cosDec = cosf(dec * DEG_TO_RAD);
+  float E = -cosDec * sinf(H);
+  float N = cosLat * sinDec - sinLat * cosDec * cosf(H);
+  float U = sinLat * sinDec + cosLat * cosDec * cosf(H);
+  azOut = atan2f(E, N) * RAD_TO_DEG; if (azOut < 0) azOut += 360;
+  elOut = asinf(constrain(U, -1.0f, 1.0f)) * RAD_TO_DEG;
+}
+
 // ---------------- プラネタリウム描画 ----------------
 static void drawHorizon() {
   int16_t px = 0, py = 0;
@@ -637,9 +892,16 @@ static void drawHorizon() {
 static void drawStarGlyph(int x, int y, int8_t mag10, int idx) {
   float tw = 0.80f + 0.20f * sinf(millis() * 0.004f + idx * 1.7f);
   uint8_t b = (uint8_t)(255 * tw);
-  uint16_t bright = canvas.color565(b, b, 255);
-  uint16_t mid    = canvas.color565(b / 2, b / 2, 170);
-  uint16_t dim    = canvas.color565(b / 5, b / 5, 90);
+  uint16_t bright, mid, dim;
+  if (displayPreset == DP_NIGHT) { // 夜間: 星も赤で (暗順応を保つ)
+    bright = canvas.color565(b, b / 6, 0);
+    mid    = canvas.color565(b / 2, b / 12, 0);
+    dim    = canvas.color565(b / 5, 0, 0);
+  } else {
+    bright = canvas.color565(b, b, 255);
+    mid    = canvas.color565(b / 2, b / 2, 170);
+    dim    = canvas.color565(b / 5, b / 5, 90);
+  }
 
   if (idx == S_PLEIADES) { // すばるは小さな星の集まりとして描く
     canvas.drawPixel(x, y, bright);
@@ -692,14 +954,57 @@ static void drawSkyMoon() {
   canvas.drawString(buf, x + 14, y - 14);
 }
 
+// 選択中の星座への誘導 (画面外なら矢印+方向、視野内なら「ここ」)
+static void drawConstellationGuide() {
+  if (selConst < 0) return;
+  float taz, tel;
+  constellationAzEl(selConst, taz, tel);
+  float daz = taz - azimuthDeg;
+  while (daz > 180) daz -= 360;
+  while (daz < -180) daz += 360;
+  float del = tel - elevationDeg;
+
+  canvas.setFont(&fonts::lgfxJapanGothic_20);
+  canvas.setTextDatum(bottom_center);
+  canvas.setTextColor(COL_ACCENT);
+  String label = String("★ ") + CONSTELLATIONS[selConst].name;
+  if (tel < -2) label += " (地平線の下)";
+  canvas.drawString(label, 160, 210);
+
+  bool centered = (fabsf(daz) < 24 && fabsf(del) < 18);
+  if (centered) {
+    canvas.setFont(&fonts::lgfxJapanGothic_16);
+    canvas.setTextColor(COL_TEXT);
+    canvas.drawString("この方向です", 160, 232);
+    canvas.drawCircle(160, 120, 30, COL_ACCENT);
+    canvas.drawCircle(160, 120, 31, COL_ACCENT);
+  } else {
+    // 中心から目標方向へ矢印 (右=daz+, 上=del+)
+    float ang = atan2f(-del, daz); // 画面座標(上が+del)に合わせ y反転
+    int cx = 160, cy = 120, len = 46;
+    int ex = cx + (int)(cosf(ang) * len), ey = cy + (int)(sinf(ang) * len);
+    canvas.drawLine(cx, cy, ex, ey, COL_ACCENT);
+    float a1 = ang + 2.6f, a2 = ang - 2.6f;
+    canvas.drawLine(ex, ey, ex + (int)(cosf(a1) * 12), ey + (int)(sinf(a1) * 12), COL_ACCENT);
+    canvas.drawLine(ex, ey, ex + (int)(cosf(a2) * 12), ey + (int)(sinf(a2) * 12), COL_ACCENT);
+    canvas.setFont(&fonts::lgfxJapanGothic_16);
+    canvas.setTextDatum(bottom_center);
+    canvas.setTextColor(COL_DIM);
+    const char* lr = daz > 8 ? "右へ" : daz < -8 ? "左へ" : "";
+    const char* ud = del > 8 ? "上へ" : del < -8 ? "下へ" : "";
+    canvas.drawString(String("体を ") + lr + ud + " 向けて", 160, 232);
+  }
+}
+
 static void drawSky() {
-  // 星座線
+  // 星座線 (選択中の星座は強調)
   for (int c = 0; c < CONSTELLATION_COUNT; ++c) {
     const Constellation& cc = CONSTELLATIONS[c];
+    uint16_t lineCol = (c == selConst) ? COL_ACCENT : COL_LINE;
     for (int l = 0; l < cc.nLines; ++l) {
       uint8_t a = cc.lines[l][0], b = cc.lines[l][1];
       if (starVis[a] && starVis[b] && (starVis[a] == 2 || starVis[b] == 2)) {
-        canvas.drawLine(starX[a], starY[a], starX[b], starY[b], COL_LINE);
+        canvas.drawLine(starX[a], starY[a], starX[b], starY[b], lineCol);
       }
     }
   }
@@ -765,6 +1070,8 @@ static void drawSky() {
   } else {
     lastSparkleStar = 255;
   }
+
+  drawConstellationGuide();
 }
 
 static void drawOverlay() {
@@ -786,14 +1093,34 @@ static void drawOverlay() {
     canvas.setTextColor(COL_WARN);
     canvas.drawString("時刻未設定 (シリアルからNで同期)", 6, 236);
   } else {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%d/%d %02d:%02d", t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min);
-    canvas.setTextColor(COL_DIM);
-    canvas.drawString(String(buf) + (ntpSynced ? " NTP" : ""), 6, 236);
+    char buf[40];
+    // 時間早送り中は「時刻+(±分/日)」を強調表示
+    if (skyOffsetSec != 0) {
+      long m = labs(skyOffsetSec) / 60;
+      char off[16];
+      if (m >= 1440)     snprintf(off, sizeof(off), "%+ld日", skyOffsetSec / 86400);
+      else if (m >= 60)  snprintf(off, sizeof(off), "%+ldh", skyOffsetSec / 3600);
+      else               snprintf(off, sizeof(off), "%+ld分", skyOffsetSec / 60);
+      snprintf(buf, sizeof(buf), "早送り %d/%d %02d:%02d %s", t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, off);
+      canvas.setTextColor(COL_ACCENT);
+    } else {
+      snprintf(buf, sizeof(buf), "%d/%d %02d:%02d%s", t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, ntpSynced ? " NTP" : "");
+      canvas.setTextColor(COL_DIM);
+    }
+    canvas.drawString(buf, 6, 236);
   }
+  // Scroll接続時: いまノブが何を操作するか
   canvas.setTextDatum(bottom_right);
-  canvas.setTextColor(COL_DIM);
-  canvas.drawString("タップ:月時計", 314, 236);
+  if (scrollOk) {
+    String extra;
+    if (knob == Knob::Display)     extra = String(":") + DP_NAME[displayPreset];
+    else if (knob == Knob::Volume) extra = String(":") + (int)(sndVol * 100 / 255) + "%";
+    canvas.setTextColor(COL_ACCENT);
+    canvas.drawString(String("◑") + KNOB_NAME[(int)knob] + extra, 314, 236);
+  } else {
+    canvas.setTextColor(COL_DIM);
+    canvas.drawString("タップ:月時計", 314, 236);
+  }
 
   canvas.drawCircle(160, 120, 5, COL_DIM);
   canvas.drawPixel(160, 120, COL_TEXT);
@@ -845,6 +1172,56 @@ static void drawBackgroundStars(int avoidX, int avoidY, int avoidR) {
   }
 }
 
+// トークン列を中央寄せで1行描画し、field==setField のものを下線で強調
+static void drawSetRow(const char* tokens[], const int fieldOf[], int n, int y) {
+  const int gap = 5;
+  int total = 0;
+  for (int i = 0; i < n; ++i) total += canvas.textWidth(tokens[i]) + (i ? gap : 0);
+  int x = 160 - total / 2;
+  canvas.setTextDatum(top_left);
+  for (int i = 0; i < n; ++i) {
+    int w = canvas.textWidth(tokens[i]);
+    bool active = (fieldOf[i] >= 0 && fieldOf[i] == setField);
+    canvas.setTextColor(active ? COL_ACCENT : (fieldOf[i] < 0 ? COL_DIM : COL_TEXT));
+    canvas.drawString(tokens[i], x, y);
+    if (active) canvas.drawFastHLine(x, y + 40, w, COL_ACCENT);
+    x += w + gap;
+  }
+}
+
+// 時刻合わせ画面 (Scrollで手動設定)
+static void drawSetTime() {
+  canvas.fillScreen(COL_BG);
+  canvas.setTextDatum(top_center);
+  canvas.setFont(&fonts::lgfxJapanGothic_20);
+  canvas.setTextColor(COL_ACCENT);
+  canvas.drawString("時刻合わせ", 160, 10);
+
+  char py[8], pm[8], pd[8], ph[8], pmin[8];
+  snprintf(py, 8, "%04d", setTm.tm_year + 1900);
+  snprintf(pm, 8, "%02d", setTm.tm_mon + 1);
+  snprintf(pd, 8, "%02d", setTm.tm_mday);
+  snprintf(ph, 8, "%02d", setTm.tm_hour);
+  snprintf(pmin, 8, "%02d", setTm.tm_min);
+
+  canvas.setFont(&fonts::lgfxJapanGothic_36);
+  const char* row1[] = { py, "/", pm, "/", pd };
+  const int   f1[]   = { 0,  -1,  1,  -1,  2 };
+  drawSetRow(row1, f1, 5, 52);
+  const char* row2[] = { ph, ":", pmin };
+  const int   f2[]   = { 3,  -1,  4 };
+  drawSetRow(row2, f2, 3, 118);
+
+  canvas.setFont(&fonts::lgfxJapanGothic_16);
+  canvas.setTextDatum(top_center);
+  canvas.setTextColor(COL_ACCENT);
+  canvas.drawString(String("設定中: ") + SETF_NAME[setField], 160, 178);
+  canvas.setFont(&fonts::lgfxJapanGothic_12);
+  canvas.setTextColor(COL_DIM);
+  canvas.drawString("回す=変更   押す=" + String(setField < 4 ? "次へ" : "確定") + "   長押し=中止", 160, 212);
+  canvas.pushSprite(0, 0);
+}
+
 static void drawMoonClock() {
   struct tm t;
   getNow(t);
@@ -863,22 +1240,25 @@ static void drawMoonClock() {
   canvas.drawString("月時計", 8, 6);
   canvas.setFont(&fonts::lgfxJapanGothic_12);
   canvas.setTextColor(COL_DIM);
-  canvas.drawString(String("タップ:星空 長押し:音") + (soundOn ? "ON" : "OFF"), 8, 26);
+  canvas.drawString(String("タップ:星空") + (scrollOk ? " Scroll長押し:時刻合わせ" : ""), 8, 26);
 
-  // 時計 (右上に大きめ)
+  // 時計 (右上に大きめ) — ここが常に本当の現在時刻
   char buf[64];
-  canvas.setFont(&fonts::Font7);
-  canvas.setTextSize(0.7f);
+  canvas.setFont(&fonts::lgfxJapanGothic_12);
   canvas.setTextDatum(top_right);
+  canvas.setTextColor(COL_DIM);
+  canvas.drawString(ntpSynced ? "現在時刻 (NTP)" : "現在時刻", 314, 6);
+  canvas.setFont(&fonts::Font7);
+  canvas.setTextSize(0.75f);
   canvas.setTextColor(COL_TEXT);
   snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
-  canvas.drawString(buf, 314, 8);
+  canvas.drawString(buf, 314, 22);
   canvas.setTextSize(1);
   canvas.setFont(&fonts::lgfxJapanGothic_12);
   canvas.setTextColor(COL_DIM);
   static const char* WD[7] = { "日", "月", "火", "水", "木", "金", "土" };
   snprintf(buf, sizeof(buf), "%d/%d(%s)", t.tm_mon + 1, t.tm_mday, WD[t.tm_wday % 7]);
-  canvas.drawString(buf, 314, 46);
+  canvas.drawString(buf, 314, 62);
 
   // 月 (暈つき)
   drawMoonHalo(moonX, moonY, moonR);
@@ -994,7 +1374,7 @@ static void drawCalibration() {
 // ---------------- 入力 ----------------
 static void handleTouch() {
   auto t = M5.Touch.getDetail();
-  if (mode == Mode::Calibrating) return;
+  if (mode == Mode::Calibrating || mode == Mode::SetTime) return;
   if (t.wasHold()) {
     if (mode == Mode::MoonClock) toggleSound(); // 月時計: 長押しで音ON/OFF
     else startCalibration();                    // 星空: 長押しで再キャリブレーション
@@ -1016,8 +1396,6 @@ static void bootStage(const char* msg, bool ng = false) {
   ++bootLine;
 }
 
-static uint32_t ntpKickAtMs = 3000; // Wi-Fi起動は画面が出た後に遅らせる (起動失敗の切り分け)
-
 void setup() {
   auto cfg = M5.config();
   cfg.internal_imu = true;
@@ -1027,11 +1405,18 @@ void setup() {
 
   prefs.begin("yozora", false);
   soundOn = prefs.getBool("sound", true);
+  sndVol  = prefs.getUChar("vol", 110);
   spkOk = M5.Speaker.isEnabled();
-  if (spkOk) M5.Speaker.setVolume(110);
+  if (spkOk) M5.Speaker.setVolume(sndVol);
+
+  // 表示プリセットを復元し、パレット・輝度を確定 (スプラッシュ描画より前に必須)
+  applyDisplayPreset(prefs.getUChar("disp", DP_NORMAL));
+
+  // Scroll Unit (あれば) を初期化
+  scrollBegin();
+  if (scrollOk) scrollUpdateLed();
 
   // 起動スプラッシュ (スプライトを使わず直接描画 → ここが出なければ電源/初期化の問題)
-  M5.Display.setBrightness(160);
   M5.Display.fillScreen(COL_BG);
   M5.Display.setTextDatum(middle_center);
   M5.Display.setFont(&fonts::lgfxJapanGothic_24);
@@ -1089,13 +1474,8 @@ void loop() {
 
   M5.update();
   handleTouch();
+  updateScroll();
   handleSerialTimeSet();
-  // Wi-Fi+NTPは起動から3秒後に開始 (起動を軽くする)
-  if (ntpKickAtMs && millis() > ntpKickAtMs) {
-    ntpKickAtMs = 0;
-    startNtpSync();
-  }
-  updateNtpSync();
   updateSound();
 
   // 月時計モード中は毎正時にチャイム
@@ -1116,6 +1496,7 @@ void loop() {
   switch (mode) {
     case Mode::Calibrating: tickCalibration(); drawCalibration(); break;
     case Mode::MoonClock:   drawMoonClock();                      break;
+    case Mode::SetTime:     drawSetTime();                        break;
     default:
       if (!imuOk) { mode = Mode::MoonClock; break; }
       drawMain();
