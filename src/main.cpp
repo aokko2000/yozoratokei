@@ -13,7 +13,14 @@
 // =============================================================
 
 #include <M5Unified.h>
+#include <M5CoreS3.h> // カメラ(GC0308)用。M5.〜 と同じ実体を参照する薄いラッパー
 #include <Preferences.h>
+#include <SPI.h>
+#include <SD.h>
+#include "img_converters.h" // fmt2jpg (RGB565→JPEG)
+
+// CoreS3 microSD (SPI)
+static constexpr int SD_SCK = 36, SD_MISO = 35, SD_MOSI = 37, SD_CS = 4;
 #include <math.h>
 #include <time.h>
 #include "star_catalog.h"
@@ -51,10 +58,14 @@ static constexpr uint16_t BASE_RING    = 0x39C7;
 static uint16_t COL_BG, COL_TEXT, COL_ACCENT, COL_WARN, COL_DIM,
                 COL_LINE, COL_CNAME, COL_SNAME, COL_HORIZON, COL_RING;
 
-// 表示プリセット: 0=標準 1=屋外(高コントラスト) 2=夜間(赤)
-enum DisplayPreset : uint8_t { DP_NORMAL = 0, DP_OUTDOOR, DP_NIGHT, DP_COUNT };
+// 表示プリセット: 0=標準 1=屋外(高コントラスト) 2=夜間(赤) 3=自動(カメラで明るさ調整)
+enum DisplayPreset : uint8_t { DP_NORMAL = 0, DP_OUTDOOR, DP_NIGHT, DP_AUTO, DP_COUNT };
 static uint8_t displayPreset = DP_NORMAL;
-static const char* DP_NAME[DP_COUNT] = { "標準", "屋外", "夜間" };
+static bool    autoBright    = false; // 自動調光中か (カメラで周囲の明るさを読む)
+static const char* DP_NAME[DP_COUNT] = { "標準", "屋外", "夜間", "自動" };
+static int     lastAmbientAvg = -1;   // 直近の明るさ指標 (デバッグ表示用)
+static uint8_t lastAmbientBri = 0;    // 直近の輝度
+static bool    lastAmbientOk  = false;
 
 static void unpack565(uint16_t c, int& r, int& g, int& b) {
   r = (c >> 11) & 0x1F; g = (c >> 5) & 0x3F; b = c & 0x1F;
@@ -78,12 +89,13 @@ static uint16_t toRed(uint16_t c) {
 
 static void applyDisplayPreset(uint8_t p) {
   displayPreset = p % DP_COUNT;
+  autoBright = (displayPreset == DP_AUTO);
   uint16_t (*f)(uint16_t) = nullptr;
   uint8_t bright = 200;
   switch (displayPreset) {
     case DP_OUTDOOR: f = brighten; bright = 255; break;
     case DP_NIGHT:   f = toRed;    bright = 70;  break;
-    default:         f = nullptr;  bright = 200; break;
+    default:         f = nullptr;  bright = 200; break; // 標準/自動は通常パレット
   }
   COL_BG      = (displayPreset == DP_NIGHT) ? 0x0000 : BASE_BG;
   COL_TEXT    = f ? f(BASE_TEXT)    : BASE_TEXT;
@@ -95,7 +107,7 @@ static void applyDisplayPreset(uint8_t p) {
   COL_SNAME   = f ? f(BASE_SNAME)   : BASE_SNAME;
   COL_HORIZON = f ? f(BASE_HORIZON) : BASE_HORIZON;
   COL_RING    = f ? f(BASE_RING)    : BASE_RING;
-  M5.Display.setBrightness(bright);
+  if (!autoBright) M5.Display.setBrightness(bright); // 自動時はサンプラーが輝度を決める
 }
 
 // ---------------- 状態 ----------------
@@ -104,7 +116,7 @@ struct Vec3 { float x, y, z; };
 static M5Canvas canvas(&M5.Display);
 static bool     spriteOk = false;
 
-enum class Mode { Calibrating, Main, MoonClock, SetTime };
+enum class Mode { Calibrating, Main, MoonClock, SetTime, Camera };
 static Mode     mode            = Mode::Main;
 static Mode     modeBeforeCalib = Mode::Main;
 static uint32_t calibEndMs      = 0;
@@ -120,6 +132,11 @@ static const char* SETF_NAME[5] = { "年", "月", "日", "時", "分" };
 
 // 時間早送り: 星空・月・イベント表示を進める/戻すオフセット (秒)。0=現在時刻。
 static long    skyOffsetSec = 0;
+
+static bool    cameraOk   = false; // GC0308カメラが初期化できたか
+static bool    ltrOk      = false; // LTR-553 環境光センサーが初期化できたか
+static bool    sdOk       = false; // microSDカードが使えるか
+static String  lastSavePath;       // 直近の保存先 (カード表示用)
 
 // ---------------- Scroll Unit (回して星座送り+時間早送り) ----------------
 static bool    scrollOk   = false;
@@ -149,6 +166,7 @@ static const char* DIR16[16] = {
 };
 
 static void startCalibration();               // 前方宣言 (シリアルコマンドから呼ぶ)
+static void captureCard();                     // 前方宣言 (カメラ撮影→カード合成)
 static void systemTimeFromTm(struct tm& t);   // 前方宣言 (時刻合わせから呼ぶ)
 static void writeRtc(struct tm& t);
 static void getNow(struct tm& out);
@@ -391,10 +409,14 @@ static void updateScroll() {
   }
   if (!down && wasDown) {
     wasDown = false;
-    if (!longFired) { // 短押し: ノブの対象を切替
-      knob = (Knob)(((uint8_t)knob + 1) % KNOB_COUNT);
-      scrollUpdateLed();
-      soundModeSwitch();
+    if (!longFired) {
+      if (mode == Mode::Camera) {
+        captureCard(); // カメラ: Scroll短押しで撮影
+      } else { // 短押し: ノブの対象を切替
+        knob = (Knob)(((uint8_t)knob + 1) % KNOB_COUNT);
+        scrollUpdateLed();
+        soundModeSwitch();
+      }
     }
   }
 }
@@ -1087,6 +1109,17 @@ static void drawOverlay() {
   canvas.setTextDatum(top_right);
   canvas.drawString((el >= 0 ? "+" : "") + String(el) + "°", 314, 4);
 
+  // 自動調光の状態表示 (カメラが読めているか確認用)
+  if (autoBright) {
+    canvas.setFont(&fonts::lgfxJapanGothic_12);
+    canvas.setTextDatum(top_center);
+    canvas.setTextColor(COL_ACCENT);
+    char ab[40];
+    if (lastAmbientOk) snprintf(ab, sizeof(ab), "自動 光%d→輝度%d", lastAmbientAvg, lastAmbientBri);
+    else               snprintf(ab, sizeof(ab), "自動 センサー無効");
+    canvas.drawString(ab, 160, 4);
+  }
+
   canvas.setFont(&fonts::lgfxJapanGothic_12);
   canvas.setTextDatum(bottom_left);
   if (t.tm_year + 1900 < 2024) {
@@ -1376,12 +1409,111 @@ static void handleTouch() {
   auto t = M5.Touch.getDetail();
   if (mode == Mode::Calibrating || mode == Mode::SetTime) return;
   if (t.wasHold()) {
-    if (mode == Mode::MoonClock) toggleSound(); // 月時計: 長押しで音ON/OFF
-    else startCalibration();                    // 星空: 長押しで再キャリブレーション
+    if (mode == Mode::Camera)         captureCard();  // カメラ: 長押しで撮影
+    else if (mode == Mode::MoonClock) toggleSound();  // 月時計: 長押しで音ON/OFF
+    else                              startCalibration(); // 星空: 長押しで再キャリブレーション
   } else if (t.wasClicked()) {
-    mode = (mode == Mode::Main) ? Mode::MoonClock : Mode::Main;
+    // タップで切替: 星空 → 月時計 → (カメラ) → 星空
+    if (mode == Mode::Main)           mode = Mode::MoonClock;
+    else if (mode == Mode::MoonClock) mode = cameraOk ? Mode::Camera : Mode::Main;
+    else                              mode = Mode::Main;
     soundModeSwitch();
   }
+}
+
+// ---------------- カメラ (M5CoreS3のGC0308。内部I2C共有はライブラリが処理) ----------------
+static uint32_t cardUntilMs = 0; // このmsまで撮影カードを固定表示
+
+// 星空メモリーカード: いまの映像に日時・月齢・月アイコンを重ねて1枚に
+static void captureCard() {
+  if (!CoreS3.Camera.get()) return;
+  canvas.pushImage(0, 0, CoreS3.Camera.fb->width, CoreS3.Camera.fb->height,
+                   (uint16_t*)CoreS3.Camera.fb->buf);
+  CoreS3.Camera.free();
+
+  struct tm t; getNow(t);
+  float d   = moonPhaseDeg();
+  float age = d / 360.f * 29.5306f;
+
+  // タイトル (左上)
+  canvas.setFont(&fonts::lgfxJapanGothic_16);
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(COL_ACCENT);
+  canvas.drawString("夜空時計", 8, 8);
+  // 月アイコン (右上)
+  drawMoonDisk(295, 26, 15, d, 0);
+  // 下部の帯 + 日時・月齢
+  canvas.fillRect(0, 198, 320, 42, canvas.color565(8, 10, 22));
+  char buf[48];
+  canvas.setFont(&fonts::lgfxJapanGothic_20);
+  canvas.setTextDatum(middle_left);
+  canvas.setTextColor(COL_TEXT);
+  snprintf(buf, sizeof(buf), "%d/%d %02d:%02d", t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min);
+  canvas.drawString(buf, 10, 219);
+  canvas.setTextDatum(middle_right);
+  canvas.setTextColor(COL_ACCENT);
+  snprintf(buf, sizeof(buf), "月齢%.1f %s", age, moonName(age));
+  canvas.drawString(buf, 312, 219);
+
+  // ここまでのカードをJPEGでSDへ保存 (状態テキストは保存後に描く)
+  lastSavePath = "";
+  if (sdOk) {
+    uint8_t* jpg = nullptr; size_t jlen = 0;
+    if (fmt2jpg((uint8_t*)canvas.getBuffer(), 320 * 240 * 2, 320, 240,
+                PIXFORMAT_RGB565, 90, &jpg, &jlen)) {
+      int n = prefs.getInt("imgn", 0) + 1;
+      char path[24];
+      snprintf(path, sizeof(path), "/yozora_%04d.jpg", n);
+      File f = SD.open(path, FILE_WRITE);
+      if (f) {
+        f.write(jpg, jlen); f.close();
+        prefs.putInt("imgn", n);
+        lastSavePath = String(path);
+      } else {
+        lastSavePath = "SD書込失敗";
+      }
+      free(jpg);
+    } else {
+      lastSavePath = "JPEG変換失敗";
+    }
+  }
+  // 保存状態 (左上・タイトル下)
+  canvas.setFont(&fonts::lgfxJapanGothic_12);
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(sdOk ? COL_TEXT : COL_DIM);
+  canvas.drawString(sdOk ? ("保存 " + lastSavePath) : "SDなし (表示のみ)", 8, 28);
+
+  canvas.pushSprite(0, 0);
+  cardUntilMs = millis() + 4000;
+  soundChime();
+}
+
+static void drawCamera() {
+  if (millis() < cardUntilMs) return; // 撮影カード表示中は固定
+  if (CoreS3.Camera.get()) {
+    M5.Display.pushImage(0, 0, CoreS3.Camera.fb->width, CoreS3.Camera.fb->height,
+                         (uint16_t*)CoreS3.Camera.fb->buf);
+    CoreS3.Camera.free();
+  }
+  M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+  M5.Display.setTextDatum(bottom_left);
+  M5.Display.setTextColor(COL_ACCENT, COL_BG);
+  M5.Display.drawString("長押し/Scroll:撮影  タップ:戻る", 6, 236);
+}
+
+// 自動調光: LTR-553 環境光センサーの値から画面輝度を決める (カメラ不使用=安定)
+static void sampleAmbient() {
+  if (!ltrOk) { lastAmbientOk = false; return; }
+  uint16_t als = CoreS3.Ltr553.getAlsValue(); // 暗い=小さい, 明るい=大きい
+  lastAmbientAvg = als;
+  lastAmbientOk  = true;
+  // ALS 0〜約800 を 輝度 25〜255 に対応 (実機の数値を見て調整可)
+  int a = (als > 1500) ? 1500 : (int)als;
+  int target = constrain((int)map(a, 0, 800, 25, 255), 25, 255);
+  static float cur = 180;
+  cur += (target - cur) * 0.30f;                          // なめらかに追従
+  lastAmbientBri = (uint8_t)cur;
+  M5.Display.setBrightness(lastAmbientBri);
 }
 
 // ---------------- メイン ----------------
@@ -1400,7 +1532,7 @@ void setup() {
   auto cfg = M5.config();
   cfg.internal_imu = true;
   cfg.internal_spk = true;
-  M5.begin(cfg);
+  CoreS3.begin(cfg); // M5.begin相当 + カメラ電源等のCoreS3固有初期化
   Serial.println("yozoratokei: boot");
 
   prefs.begin("yozora", false);
@@ -1456,7 +1588,25 @@ void setup() {
   Serial.printf("imu=%d rtc=%d\n", (int)M5.Imu.getType(), (int)rtcOk);
   bootStage(imuOk ? "4 センサー OK" : "4 センサー NG", !imuOk);
   bool haveOffsets = imuOk && M5.Imu.loadOffsetFromNVS();
-  bootStage("5 起動完了");
+
+  cameraOk = CoreS3.Camera.begin(); // 失敗してもカメラ機能を無効化するだけ
+  Serial.printf("camera: %s\n", cameraOk ? "OK" : "FAIL");
+  bootStage(cameraOk ? "5 カメラ OK" : "5 カメラ NG(無効)", !cameraOk);
+
+  // LTR-553 環境光センサー (自動調光に使用)
+  Ltr5xx_Init_Basic_Para ltrPara = {};
+  ltrPara.ps_led_pulse_freq   = LTR5XX_LED_PULSE_FREQ_40KHZ;
+  ltrPara.ps_measurement_rate = LTR5XX_PS_MEASUREMENT_RATE_50MS;
+  ltrPara.als_gain            = LTR5XX_ALS_GAIN_48X;
+  ltrOk = CoreS3.Ltr553.begin(&ltrPara);
+  if (ltrOk) CoreS3.Ltr553.setAlsMode(LTR5XX_ALS_ACTIVE_MODE);
+  Serial.printf("ltr553: %s\n", ltrOk ? "OK" : "FAIL");
+
+  // microSD (写真カードのJPEG保存に使用。無ければ表示のみ)
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  sdOk = SD.begin(SD_CS, SPI, 20000000);
+  Serial.printf("sd: %s\n", sdOk ? "OK" : "none");
+  bootStage("6 起動完了");
   delay(600); // 進捗を見せる
 
   if (!imuOk) {
@@ -1493,10 +1643,17 @@ void loop() {
     computeAttitude();
   }
 
+  // 自動調光 (LTR-553を0.5秒おきに読む。カメラ不使用なので全モードで可)
+  if (autoBright) {
+    static uint32_t lastAmbientMs = 0;
+    if (millis() - lastAmbientMs > 500) { lastAmbientMs = millis(); sampleAmbient(); }
+  }
+
   switch (mode) {
     case Mode::Calibrating: tickCalibration(); drawCalibration(); break;
     case Mode::MoonClock:   drawMoonClock();                      break;
     case Mode::SetTime:     drawSetTime();                        break;
+    case Mode::Camera:      drawCamera();                         break;
     default:
       if (!imuOk) { mode = Mode::MoonClock; break; }
       drawMain();
