@@ -117,7 +117,7 @@ struct Vec3 { float x, y, z; };
 static M5Canvas canvas(&M5.Display);
 static bool     spriteOk = false;
 
-enum class Mode { Calibrating, Main, MoonClock, SetTime, Camera };
+enum class Mode { Calibrating, Main, MoonClock, SetTime, Camera, Home };
 static Mode     mode            = Mode::Main;
 static Mode     modeBeforeCalib = Mode::Main;
 static uint32_t calibEndMs      = 0;
@@ -702,17 +702,18 @@ static int eclipseNow() {
 }
 
 // --- 流星群テーブル (毎年の極大日, span=前後この日数は「活動中」) ---
-struct MeteorEv { int8_t mo, d; const char* name; uint8_t zhr; int8_t span; };
+// ra/dec は放射点(輻射点)。流れ星をその方向から飛ばすのに使う。
+struct MeteorEv { int8_t mo, d; const char* name; uint8_t zhr; int8_t span; float ra, dec; };
 static const MeteorEv METEORS[] = {
-  { 1,  4, "しぶんぎ座流星群",   110, 2},
-  { 4, 22, "4月こと座流星群",     18, 2},
-  { 5,  6, "みずがめ座η流星群",   50, 3},
-  { 7, 30, "みずがめ座δ流星群",   25, 3},
-  { 8, 13, "ペルセウス座流星群",  100, 4},
-  {10, 21, "オリオン座流星群",    20, 3},
-  {11, 17, "しし座流星群",        15, 2},
-  {12, 14, "ふたご座流星群",     150, 3},
-  {12, 22, "こぐま座流星群",      10, 2},
+  { 1,  4, "しぶんぎ座流星群",   110, 2, 230.1f, +49.5f},
+  { 4, 22, "4月こと座流星群",     18, 2, 271.4f, +33.6f},
+  { 5,  6, "みずがめ座η流星群",   50, 3, 338.0f,  -1.0f},
+  { 7, 30, "みずがめ座δ流星群",   25, 3, 339.0f, -16.4f},
+  { 8, 13, "ペルセウス座流星群",  100, 4,  46.2f, +57.4f},
+  {10, 21, "オリオン座流星群",    20, 3,  95.2f, +15.6f},
+  {11, 17, "しし座流星群",        15, 2, 152.3f, +21.6f},
+  {12, 14, "ふたご座流星群",     150, 3, 112.3f, +32.5f},
+  {12, 22, "こぐま座流星群",      10, 2, 217.0f, +75.9f},
 };
 
 static int meteorDiffDays(const MeteorEv& m, const struct tm& t) {
@@ -900,6 +901,83 @@ static void updateBattery() {
   battCharging = (M5.Power.isCharging() == m5::Power_Class::is_charging);
 }
 
+// ---------------- 流れ星 ----------------
+// 普段はごくたまに。流星群の期間中は頻度が上がり、放射点から正しい向きに飛ぶ。
+struct Shoot { bool active; float x, y, vx, vy; int life, maxLife; };
+static Shoot shoots[3] = {};
+
+static bool radiantScreenPos(const MeteorEv* m, int16_t& rx, int16_t& ry) {
+  if (!m) return false;
+  float lst = localSiderealDeg();
+  float sinLat = sinf(OBS_LAT_DEG * DEG_TO_RAD), cosLat = cosf(OBS_LAT_DEG * DEG_TO_RAD);
+  return projectEquatorial(m->ra, m->dec, lst, sinLat, cosLat, rx, ry) != 0;
+}
+
+static void spawnShoot(const MeteorEv* act) {
+  for (auto& s : shoots) {
+    if (s.active) continue;
+    float px = random(20, 300), py = random(15, 200);
+    float dx, dy;
+    int16_t rx, ry;
+    if (act && radiantScreenPos(act, rx, ry)) { // 放射点から遠ざかる向き
+      dx = px - rx; dy = py - ry;
+      float L = sqrtf(dx * dx + dy * dy);
+      if (L < 1.0f) { dx = 1; dy = 0; L = 1; }
+      dx /= L; dy /= L;
+    } else {                                    // 散在流星: 向きはランダム
+      float a = random(0, 628) / 100.0f;
+      dx = cosf(a); dy = sinf(a);
+    }
+    float sp = 4.0f + random(0, 30) / 10.0f;
+    s.active = true; s.x = px; s.y = py; s.vx = dx * sp; s.vy = dy * sp;
+    s.maxLife = 14 + random(0, 12); s.life = s.maxLife;
+    return;
+  }
+}
+
+static void updateShoots() {
+  static uint32_t nextMs = 0;
+  uint32_t now = millis();
+  int days;
+  const MeteorEv* act = meteorActive(&days);
+  if (now > nextMs) {
+    uint32_t interval = 22000;                       // 普段: 20秒に1個くらい
+    if (act) interval = constrain(120000u / (act->zhr ? act->zhr : 10u), 1500u, 20000u);
+    nextMs = now + interval / 2 + random(0, interval);
+    spawnShoot(act);
+  }
+  for (auto& s : shoots) {
+    if (!s.active) continue;
+    s.x += s.vx; s.y += s.vy;
+    if (--s.life <= 0 || s.x < -20 || s.x > 340 || s.y < -20 || s.y > 260) { s.active = false; continue; }
+    float k = (float)s.life / (float)s.maxLife;      // 1→0 で減衰
+    uint8_t b = (uint8_t)(255 * k);
+    canvas.drawLine((int)(s.x - s.vx * 4.0f), (int)(s.y - s.vy * 4.0f), (int)s.x, (int)s.y,
+                    canvas.color565(b / 3, b / 3, b / 2));
+    canvas.drawLine((int)(s.x - s.vx * 1.5f), (int)(s.y - s.vy * 1.5f), (int)s.x, (int)s.y,
+                    canvas.color565(b, b, 255));
+  }
+}
+
+// ---------------- おうち星空 (窓): かざさなくても本物の空がゆっくり流れる ----------------
+// 時刻は実時間のまま。視点だけを自動で旋回させるので「いま頭上にある空」が映る。
+static void homeAttitude() {
+  float t  = millis() * 0.001f;
+  float A  = fmodf(t * 0.8f, 360.0f);           // 約7.5分で東→南→西→北と一周
+  float EL = 35.0f + 18.0f * sinf(t * 0.05f);   // 高度もゆっくり上下
+  float ar = A * DEG_TO_RAD, er = EL * DEG_TO_RAD;
+  Vec3 f = { sinf(ar) * cosf(er), cosf(ar) * cosf(er), sinf(er) }; // 見ている方向 (東,北,天頂)
+  Vec3 wup = { 0, 0, 1 };
+  Vec3 r = cross(f, wup);
+  if (!normalize(r)) r = Vec3{ 1, 0, 0 };
+  Vec3 u = cross(r, f);
+  // 世界座標軸をデバイス座標で表す (実機の姿勢の代わり)
+  gEast  = Vec3{ r.x, u.x, -f.x };
+  gNorth = Vec3{ r.y, u.y, -f.y };
+  gUp    = Vec3{ r.z, u.z, -f.z };
+  azimuthDeg = A; elevationDeg = EL; haveAzEl = true;
+}
+
 // 小さなバッテリー表示 (アイコン + %。外観を邪魔しないよう控えめに)
 static void drawBatteryIcon(int x, int y) {
   int  lvl = battLevel;      // キャッシュ値 (I2Cアクセスしない)
@@ -1063,6 +1141,8 @@ static void drawSky() {
   for (int i = 0; i < STAR_COUNT; ++i) {
     if (starVis[i] == 2) drawStarGlyph(starX[i], starY[i], STARS[i].mag10, i);
   }
+  // 流れ星 (星の上に重ねる)
+  updateShoots();
   // 月
   drawSkyMoon();
   // 有名な星の名前
@@ -1134,7 +1214,8 @@ static void drawOverlay() {
   canvas.setTextColor(COL_TEXT);
   int dirIdx = ((int)roundf(azimuthDeg / 22.5f)) % 16;
   int el = (int)roundf(elevationDeg);
-  canvas.drawString(String(DIR16[dirIdx]) + " " + String((int)roundf(azimuthDeg)) + "°", 6, 4);
+  canvas.drawString((mode == Mode::Home ? String("おうち ") : String("")) +
+                    DIR16[dirIdx] + " " + String((int)roundf(azimuthDeg)) + "°", 6, 4);
   canvas.setTextDatum(top_right);
   canvas.drawString((el >= 0 ? "+" : "") + String(el) + "°", 314, 4);
 
@@ -1443,10 +1524,12 @@ static void handleTouch() {
   if (t.wasHold()) {
     if (mode == Mode::Camera)         captureCard();  // カメラ: 長押しで撮影
     else if (mode == Mode::MoonClock) toggleSound();  // 月時計: 長押しで音ON/OFF
+    else if (mode == Mode::Home)      toggleSound();  // おうち星空: 長押しで音ON/OFF
     else                              startCalibration(); // 星空: 長押しで再キャリブレーション
   } else if (t.wasClicked()) {
-    // タップで切替: 星空 → 月時計 → (カメラ) → 星空
-    if (mode == Mode::Main)           mode = Mode::MoonClock;
+    // タップで切替: 星空 → おうち星空 → 月時計 → (カメラ) → 星空
+    if (mode == Mode::Main)           mode = Mode::Home;
+    else if (mode == Mode::Home)      mode = Mode::MoonClock;
     else if (mode == Mode::MoonClock) mode = cameraOk ? Mode::Camera : Mode::Main;
     else                              mode = Mode::Main;
     soundModeSwitch();
@@ -1740,6 +1823,7 @@ void loop() {
     case Mode::MoonClock:   drawMoonClock();                      break;
     case Mode::SetTime:     drawSetTime();                        break;
     case Mode::Camera:      drawCamera();                         break;
+    case Mode::Home:        homeAttitude(); drawMain();           break; // かざさずに眺める
     default:
       if (!imuOk) { mode = Mode::MoonClock; break; }
       drawMain();
