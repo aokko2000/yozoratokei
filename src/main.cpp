@@ -17,6 +17,7 @@
 #include <Preferences.h>
 #include <SPI.h>
 #include <SD.h>
+#include "esp_camera.h"     // esp_camera_deinit (カメラを使う時だけ動かす)
 #include "img_converters.h" // fmt2jpg (RGB565→JPEG)
 
 // CoreS3 microSD (SPI)
@@ -133,7 +134,8 @@ static const char* SETF_NAME[5] = { "年", "月", "日", "時", "分" };
 // 時間早送り: 星空・月・イベント表示を進める/戻すオフセット (秒)。0=現在時刻。
 static long    skyOffsetSec = 0;
 
-static bool    cameraOk   = false; // GC0308カメラが初期化できたか
+static bool    cameraOk   = false; // GC0308カメラが使えるか (起動時に確認)
+static bool    camRunning = false; // いまカメラドライバが動作中か
 static bool    ltrOk      = false; // LTR-553 環境光センサーが初期化できたか
 static bool    sdOk       = false; // microSDカードが使えるか
 static String  lastSavePath;       // 直近の保存先 (カード表示用)
@@ -887,6 +889,33 @@ static void constellationAzEl(int c, float& azOut, float& elOut) {
   elOut = asinf(constrain(U, -1.0f, 1.0f)) * RAD_TO_DEG;
 }
 
+// バッテリー値は5秒おきにだけ読む (毎フレームPMICをI2Cで叩くとカメラのSCCBと競合する)
+static int  battLevel    = 100;
+static bool battCharging = false;
+static void updateBattery() {
+  static uint32_t last = 0;
+  if (last != 0 && millis() - last < 5000) return;
+  last = millis();
+  battLevel    = constrain(M5.Power.getBatteryLevel(), 0, 100);
+  battCharging = (M5.Power.isCharging() == m5::Power_Class::is_charging);
+}
+
+// 小さなバッテリー表示 (アイコン + %。外観を邪魔しないよう控えめに)
+static void drawBatteryIcon(int x, int y) {
+  int  lvl = battLevel;      // キャッシュ値 (I2Cアクセスしない)
+  bool chg = battCharging;
+  uint16_t col = chg ? canvas.color565(90, 210, 120)
+                     : (lvl <= 20 ? COL_WARN : COL_DIM);
+  canvas.drawRect(x, y, 17, 9, col);
+  canvas.drawFastVLine(x + 17, y + 3, 3, col);     // 端子
+  int w = (lvl * 15) / 100;
+  if (w > 0) canvas.fillRect(x + 1, y + 1, w, 7, col);
+  canvas.setFont(&fonts::lgfxJapanGothic_12);
+  canvas.setTextDatum(middle_left);
+  canvas.setTextColor(col);
+  canvas.drawString(String(lvl) + "%" + (chg ? "+" : ""), x + 22, y + 4);
+}
+
 // ---------------- プラネタリウム描画 ----------------
 static void drawHorizon() {
   int16_t px = 0, py = 0;
@@ -1155,6 +1184,8 @@ static void drawOverlay() {
     canvas.drawString("タップ:月時計", 314, 236);
   }
 
+  drawBatteryIcon(128, 228); // 下部中央 (時刻とノブ表示の間の空き)
+
   canvas.drawCircle(160, 120, 5, COL_DIM);
   canvas.drawPixel(160, 120, COL_TEXT);
 
@@ -1292,6 +1323,7 @@ static void drawMoonClock() {
   static const char* WD[7] = { "日", "月", "火", "水", "木", "金", "土" };
   snprintf(buf, sizeof(buf), "%d/%d(%s)", t.tm_mon + 1, t.tm_mday, WD[t.tm_wday % 7]);
   canvas.drawString(buf, 314, 62);
+  drawBatteryIcon(258, 78); // 日付の下に控えめに
 
   // 月 (暈つき)
   drawMoonHalo(moonX, moonY, moonR);
@@ -1422,10 +1454,42 @@ static void handleTouch() {
 }
 
 // ---------------- カメラ (M5CoreS3のGC0308。内部I2C共有はライブラリが処理) ----------------
+// カメラドライバはカメラモードの間だけ動かす。常時動かしたままにすると、フレームを
+// 消費しない時間が続いたときに内部タスク(cam_task)のスタックが溢れて再起動する。
 static uint32_t cardUntilMs = 0; // このmsまで撮影カードを固定表示
+
+static void startCamera() {
+  if (camRunning) return;
+  camRunning = CoreS3.Camera.begin();
+  Serial.printf("camera start: %s\n", camRunning ? "ok" : "fail");
+}
+
+// カメラ終了時は再起動する。
+// CoreS3ではカメラのSCCBが内部I2C(コンパス/タッチ/RTC/電源と共用)を再利用しており、
+// esp_camera_deinit() がそのI2Cドライバごと破棄してコンパスが復帰しないため、
+// 再起動でバスを作り直すのが確実。時刻はRTC、補正値はNVSに残るので設定は失われない。
+static void stopCamera() {
+  if (!camRunning) return;
+  M5.Display.fillScreen(COL_BG);
+  M5.Display.setFont(&fonts::lgfxJapanGothic_20);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(COL_ACCENT, COL_BG);
+  M5.Display.drawString("カメラを終了します", 160, 108);
+  M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+  M5.Display.setTextColor(COL_DIM, COL_BG);
+  M5.Display.drawString("(コンパス復帰のため再起動)", 160, 142);
+  Serial.println("camera stop -> restart");
+  delay(900);
+  ESP.restart();
+}
 
 // 星空メモリーカード: いまの映像に日時・月齢・月アイコンを重ねて1枚に
 static void captureCard() {
+  if (!camRunning) return;
+  if (millis() < cardUntilMs) return;     // カード表示中の二重撮影を防ぐ
+  soundSparkle();                         // 押した瞬間のフィードバック
+  Serial.printf("capture: heap=%u psram=%u\n",
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
   if (!CoreS3.Camera.get()) return;
   canvas.pushImage(0, 0, CoreS3.Camera.fb->width, CoreS3.Camera.fb->height,
                    (uint16_t*)CoreS3.Camera.fb->buf);
@@ -1460,7 +1524,7 @@ static void captureCard() {
   if (sdOk) {
     uint8_t* jpg = nullptr; size_t jlen = 0;
     if (fmt2jpg((uint8_t*)canvas.getBuffer(), 320 * 240 * 2, 320, 240,
-                PIXFORMAT_RGB565, 90, &jpg, &jlen)) {
+                PIXFORMAT_RGB565, 80, &jpg, &jlen)) {
       int n = prefs.getInt("imgn", 0) + 1;
       char path[24];
       snprintf(path, sizeof(path), "/yozora_%04d.jpg", n);
@@ -1490,6 +1554,14 @@ static void captureCard() {
 
 static void drawCamera() {
   if (millis() < cardUntilMs) return; // 撮影カード表示中は固定
+  if (!camRunning) {
+    M5.Display.fillScreen(COL_BG);
+    M5.Display.setFont(&fonts::lgfxJapanGothic_20);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(COL_WARN, COL_BG);
+    M5.Display.drawString("カメラを起動できません", 160, 120);
+    return;
+  }
   if (CoreS3.Camera.get()) {
     M5.Display.pushImage(0, 0, CoreS3.Camera.fb->width, CoreS3.Camera.fb->height,
                          (uint16_t*)CoreS3.Camera.fb->buf);
@@ -1558,7 +1630,7 @@ void setup() {
   M5.Display.setTextColor(COL_DIM, COL_BG);
   M5.Display.drawString("起動中...", 160, 136);
 
-  // 描画スプライト: まず内部RAM、だめならPSRAM、それでもだめなら8bit
+  // 描画スプライト: 内部RAM優先 (PSRAMだと描画が重くなりScrollの反応が鈍る)
   canvas.setColorDepth(16);
   spriteOk = (canvas.createSprite(320, 240) != nullptr);
   if (!spriteOk) {
@@ -1589,7 +1661,10 @@ void setup() {
   bootStage(imuOk ? "4 センサー OK" : "4 センサー NG", !imuOk);
   bool haveOffsets = imuOk && M5.Imu.loadOffsetFromNVS();
 
-  cameraOk = CoreS3.Camera.begin(); // 失敗してもカメラ機能を無効化するだけ
+  // カメラは起動確認だけして一旦止める (使うのはカメラモードの間だけ)
+  cameraOk = CoreS3.Camera.begin();
+  if (cameraOk) { esp_camera_deinit(); }
+  camRunning = false;
   Serial.printf("camera: %s\n", cameraOk ? "OK" : "FAIL");
   bootStage(cameraOk ? "5 カメラ OK" : "5 カメラ NG(無効)", !cameraOk);
 
@@ -1627,6 +1702,7 @@ void loop() {
   updateScroll();
   handleSerialTimeSet();
   updateSound();
+  updateBattery();
 
   // 月時計モード中は毎正時にチャイム
   if (mode == Mode::MoonClock) {
@@ -1647,6 +1723,16 @@ void loop() {
   if (autoBright) {
     static uint32_t lastAmbientMs = 0;
     if (millis() - lastAmbientMs > 500) { lastAmbientMs = millis(); sampleAmbient(); }
+  }
+
+  // モードが変わった瞬間にカメラを起動/停止する (カメラモードの間だけ動かす)
+  {
+    static Mode prevMode = Mode::Main;
+    if (mode != prevMode) {
+      if (mode == Mode::Camera)          startCamera();
+      else if (prevMode == Mode::Camera) stopCamera();
+      prevMode = mode;
+    }
   }
 
   switch (mode) {
